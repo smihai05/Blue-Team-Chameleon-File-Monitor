@@ -1,0 +1,1786 @@
+import os
+import sys
+import json
+import csv
+import threading
+from pathlib import Path
+from datetime import datetime
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+APP_NAME = "CHAMELEON"
+
+SNAPSHOT_FILE = Path.home() / ".filewatch_snapshot.json"
+
+WATCH_EXTENSIONS = {
+    ".exe",
+    ".msi",
+    ".bat",
+    ".cmd",
+    ".ps1",
+    ".vbs",
+    ".vbe",
+    ".js",
+    ".jse",
+    ".scr",
+    ".com",
+    ".dll",
+    ".hta",
+    ".lnk",
+}
+
+
+# ============================================================
+# RESOURCE PATH
+# ============================================================
+
+def resource_path(filename):
+    """
+    Găsește fișierele atât când rulezi .py,
+    cât și când aplicația este împachetată cu PyInstaller.
+    """
+
+    if getattr(sys, "frozen", False):
+        base_path = sys._MEIPASS
+    else:
+        base_path = os.path.dirname(
+            os.path.abspath(__file__)
+        )
+
+    return os.path.join(
+        base_path,
+        filename
+    )
+
+
+# ============================================================
+# FILE HELPERS
+# ============================================================
+
+def get_file_info(path):
+    try:
+        stat = path.stat()
+
+        return {
+            "path": str(path),
+            "name": path.name,
+            "extension": path.suffix.lower(),
+            "size": stat.st_size,
+            "modified": stat.st_mtime,
+            "hash": None,
+        }
+
+    except (PermissionError, OSError):
+        return None
+
+
+def scan_directory(
+    directory,
+    include_all=False,
+    progress_callback=None,
+):
+    results = {}
+
+    directory = Path(directory)
+
+    if not directory.exists():
+        return results
+
+    checked = 0
+
+    ignored_directories = {
+        "$Recycle.Bin",
+        "System Volume Information",
+        "node_modules",
+        ".git",
+    }
+
+    for root, dirs, files in os.walk(directory):
+
+        dirs[:] = [
+            d
+            for d in dirs
+            if d not in ignored_directories
+        ]
+
+        for filename in files:
+
+            path = Path(root) / filename
+
+            if not include_all:
+                if path.suffix.lower() not in WATCH_EXTENSIONS:
+                    continue
+
+            info = get_file_info(path)
+
+            if info is not None:
+                results[str(path)] = info
+
+            checked += 1
+
+            if (
+                progress_callback is not None
+                and checked % 10 == 0
+            ):
+                progress_callback(checked)
+
+    if progress_callback is not None:
+        progress_callback(checked)
+
+    return results
+
+
+# ============================================================
+# SNAPSHOT
+# ============================================================
+
+def load_snapshot():
+    if not SNAPSHOT_FILE.exists():
+        return {}
+
+    try:
+        with open(
+            SNAPSHOT_FILE,
+            "r",
+            encoding="utf-8",
+        ) as file:
+
+            return json.load(file)
+
+    except (
+        json.JSONDecodeError,
+        OSError,
+    ):
+        return {}
+
+
+def save_snapshot(data):
+    try:
+        with open(
+            SNAPSHOT_FILE,
+            "w",
+            encoding="utf-8",
+        ) as file:
+
+            json.dump(
+                data,
+                file,
+                indent=2,
+            )
+
+    except OSError:
+        pass
+
+
+# ============================================================
+# MAIN APPLICATION
+# ============================================================
+
+class FileWatchApp:
+
+    def __init__(self, root):
+
+        self.root = root
+
+        # ----------------------------------------------------
+        # WINDOW
+        # ----------------------------------------------------
+
+        self.root.title(
+            "Chameleon — FILE MONITOR"
+        )
+
+        self.root.geometry(
+            "1150x700"
+        )
+
+        self.root.minsize(
+            950,
+            600
+        )
+
+        self.root.configure(
+            bg="#080b0d"
+        )
+
+        # ----------------------------------------------------
+        # DATA
+        # ----------------------------------------------------
+
+        self.scan_results = []
+
+        self.current_snapshot = {}
+        self.table_render_id = 0
+
+        # ----------------------------------------------------
+        # SCAN STATE
+        # ----------------------------------------------------
+
+        self.scanning = False
+
+        self.progress_pending = False
+        self.latest_progress = 0
+
+        self.status_filter = "ALL"
+        self.type_filter = "ALL"
+
+        # ----------------------------------------------------
+        # TURTLE STATE
+        # ----------------------------------------------------
+
+        self.turtle_running = False
+
+        self.turtle_x = -100
+
+        self.turtle_frame = 0
+
+        # ----------------------------------------------------
+        # STYLE
+        # ----------------------------------------------------
+
+        self.setup_style()
+
+        # ----------------------------------------------------
+        # UI
+        # ----------------------------------------------------
+
+        self.build_ui()
+
+
+    # ========================================================
+    # STYLE
+    # ========================================================
+
+    def setup_style(self):
+
+        style = ttk.Style()
+
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure(
+            "Treeview",
+            background="#0b1012",
+            foreground="#d7fdf0",
+            fieldbackground="#0b1012",
+            rowheight=28,
+            borderwidth=0,
+            font=(
+                "Consolas",
+                10,
+            ),
+        )
+
+        style.configure(
+            "Treeview.Heading",
+            background="#101719",
+            foreground="#35f2b5",
+            font=(
+                "Consolas",
+                10,
+                "bold",
+            ),
+            borderwidth=0,
+        )
+
+        style.map(
+            "Treeview",
+            background=[
+                (
+                    "selected",
+                    "#123d32",
+                )
+            ],
+            foreground=[
+                (
+                    "selected",
+                    "#66ffd0",
+                )
+            ],
+        )
+
+
+    # ========================================================
+    # BUILD UI
+    # ========================================================
+
+    def build_ui(self):
+
+        # ----------------------------------------------------
+        # HEADER
+        # ----------------------------------------------------
+
+        header = tk.Frame(
+            self.root,
+            bg="#080b0d",
+            height=110,
+        )
+
+        header.pack(
+            fill="x"
+        )
+
+        title = tk.Label(
+            header,
+            text="CHAMELEON",
+            font=(
+                "Consolas",
+                26,
+                "bold",
+            ),
+            fg="#35f2b5",
+            bg="#080b0d",
+        )
+
+        title.pack(
+            anchor="w",
+            padx=25,
+            pady=(
+                15,
+                0,
+            ),
+        )
+
+        subtitle = tk.Label(
+            header,
+            text=(
+                "LOCAL FILE INTEGRITY "
+                "// MONITORING NODE"
+            ),
+            font=(
+                "Consolas",
+                9,
+            ),
+            fg="#6b817a",
+            bg="#080b0d",
+        )
+
+        subtitle.pack(
+            anchor="w",
+            padx=27,
+        )
+
+        # ----------------------------------------------------
+        # TURTLE CANVAS
+        # ----------------------------------------------------
+
+        self.turtle_canvas = tk.Canvas(
+            header,
+            width=300,
+            height=105,
+            bg="#080b0d",
+            highlightthickness=0,
+        )
+
+        self.turtle_canvas.place(
+            relx=1.0,
+            x=-10,
+            y=2,
+            anchor="ne",
+        )
+
+        self.draw_turtle()
+
+        # ----------------------------------------------------
+        # STATUS BAR
+        # ----------------------------------------------------
+
+        status_frame = tk.Frame(
+            self.root,
+            bg="#0d1315",
+            height=40,
+        )
+
+        status_frame.pack(
+            fill="x"
+        )
+
+        self.status_label = tk.Label(
+            status_frame,
+            text="● SYSTEM READY",
+            font=(
+                "Consolas",
+                10,
+                "bold",
+            ),
+            fg="#35f2b5",
+            bg="#0d1315",
+        )
+
+        self.status_label.pack(
+            side="left",
+            padx=20,
+        )
+
+        self.counter_label = tk.Label(
+            status_frame,
+            text="FILES: 0",
+            font=(
+                "Consolas",
+                10,
+            ),
+            fg="#78918a",
+            bg="#0d1315",
+        )
+
+        self.counter_label.pack(
+            side="right",
+            padx=20,
+        )
+
+        # ----------------------------------------------------
+        # CONTROLS
+        # ----------------------------------------------------
+
+        controls = tk.Frame(
+            self.root,
+            bg="#080b0d",
+        )
+
+        controls.pack(
+            fill="x",
+            padx=20,
+            pady=15,
+        )
+
+        tk.Label(
+            controls,
+            text="TARGET",
+            font=(
+                "Consolas",
+                9,
+                "bold",
+            ),
+            fg="#35f2b5",
+            bg="#080b0d",
+        ).pack(
+            side="left"
+        )
+
+        self.path_var = tk.StringVar(
+            value=str(
+                Path.home()
+            )
+        )
+
+        path_entry = tk.Entry(
+            controls,
+            textvariable=self.path_var,
+            bg="#0d1315",
+            fg="#d7fdf0",
+            insertbackground="#35f2b5",
+            relief="flat",
+            font=(
+                "Consolas",
+                10,
+            ),
+            width=55,
+        )
+
+        path_entry.pack(
+            side="left",
+            padx=10,
+            ipady=7,
+        )
+
+        self.browse_btn = self.create_button(
+            controls,
+            "BROWSE",
+            self.browse,
+        )
+
+        self.browse_btn.pack(
+            side="left",
+            padx=5,
+        )
+
+        self.scan_btn = self.create_button(
+            controls,
+            "SCAN",
+            self.start_scan,
+            accent=True,
+        )
+
+        self.scan_btn.pack(
+            side="left",
+            padx=5,
+        )
+
+        self.baseline_btn = self.create_button(
+            controls,
+            "SET BASELINE",
+            self.set_baseline,
+        )
+
+        self.baseline_btn.pack(
+            side="left",
+            padx=5,
+        )
+
+        self.export_btn = self.create_button(
+            controls,
+            "EXPORT CSV",
+            self.export_csv,
+        )
+
+        self.export_btn.pack(
+            side="right"
+        )
+
+        # ----------------------------------------------------
+        # FILTER
+        # ----------------------------------------------------
+
+        filter_frame = tk.Frame(
+            self.root,
+            bg="#080b0d",
+        )
+
+        filter_frame.pack(
+            fill="x",
+            padx=20,
+        )
+
+        self.only_suspicious = tk.BooleanVar(
+            value=False
+        )
+
+        self.filter_check = tk.Checkbutton(
+            filter_frame,
+            text=(
+                "ONLY EXECUTABLE / "
+                "SCRIPT FILES"
+            ),
+            variable=self.only_suspicious,
+            command=self.refresh_table,
+            bg="#080b0d",
+            fg="#78918a",
+            activebackground="#080b0d",
+            activeforeground="#35f2b5",
+            selectcolor="#0d1315",
+            font=(
+                "Consolas",
+                9,
+            ),
+        )
+
+        self.filter_check.pack(
+            side="left"
+        )
+
+        # ----------------------------------------------------
+        # TABLE
+        # ----------------------------------------------------
+
+        table_frame = tk.Frame(
+            self.root,
+            bg="#080b0d",
+        )
+
+        table_frame.pack(
+            fill="both",
+            expand=True,
+            padx=20,
+            pady=10,
+        )
+
+        columns = (
+            "status",
+            "name",
+            "extension",
+            "size",
+            "modified",
+            "path",
+        )
+
+        self.tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings",
+        )
+
+        headings = {
+            "status": "STATUS",
+            "name": "FILE",
+            "extension": "TYPE",
+            "size": "SIZE",
+            "modified": "MODIFIED",
+            "path": "LOCATION",
+        }
+
+        widths = {
+            "status": 90,
+            "name": 190,
+            "extension": 80,
+            "size": 90,
+            "modified": 150,
+            "path": 500,
+        }
+
+        for column in columns:
+
+            if column == "status":
+                self.tree.heading(
+                    column,
+                    text=headings[column],
+                    command=self.cycle_status_filter,
+                )
+            elif column == "extension":
+                self.tree.heading(
+                    column,
+                    text=headings[column],
+                    command=self.cycle_extension_filter,
+                )
+            else:
+                self.tree.heading(
+                    column,
+                    text=headings[column],
+                )
+
+            self.tree.column(
+                column,
+                width=widths[column],
+                anchor="w",
+            )
+
+        self.update_table_headers()
+
+        scrollbar = ttk.Scrollbar(
+            table_frame,
+            orient="vertical",
+            command=self.tree.yview,
+        )
+
+        self.tree.configure(
+            yscrollcommand=scrollbar.set
+        )
+
+        self.tree.pack(
+            side="left",
+            fill="both",
+            expand=True,
+        )
+
+        scrollbar.pack(
+            side="right",
+            fill="y",
+        )
+
+        # ----------------------------------------------------
+        # TABLE COLORS
+        # ----------------------------------------------------
+
+        self.tree.tag_configure(
+            "NEW",
+            foreground="#35f2b5",
+        )
+
+        self.tree.tag_configure(
+            "MODIFIED",
+            foreground="#ffd166",
+        )
+
+        self.tree.tag_configure(
+            "UNCHANGED",
+            foreground="#71857f",
+        )
+
+        # ----------------------------------------------------
+        # FOOTER
+        # ----------------------------------------------------
+
+        footer = tk.Label(
+            self.root,
+            text=(
+                "CHAMELEON  •  LOCAL ONLY  •  "
+                "NO FILES ARE MODIFIED"
+            ),
+            font=(
+                "Consolas",
+                8,
+            ),
+            fg="#3d514c",
+            bg="#080b0d",
+        )
+
+        footer.pack(
+            pady=(
+                0,
+                8,
+            )
+        )
+
+
+    # ========================================================
+    # BUTTON
+    # ========================================================
+
+    def create_button(
+        self,
+        parent,
+        text,
+        command,
+        accent=False,
+    ):
+
+        if accent:
+            bg = "#123d32"
+            fg = "#66ffd0"
+        else:
+            bg = "#101719"
+            fg = "#91aaa3"
+
+        return tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=bg,
+            fg=fg,
+            activebackground="#1a5445",
+            activeforeground="#ffffff",
+            relief="flat",
+            borderwidth=0,
+            font=(
+                "Consolas",
+                9,
+                "bold",
+            ),
+            padx=12,
+            pady=8,
+            cursor="hand2",
+        )
+
+
+    # ========================================================
+    # PIXEL TURTLE
+    # ========================================================
+
+    def draw_turtle(self):
+
+        canvas = self.turtle_canvas
+
+        canvas.delete("all")
+
+        width = 300
+        height = 105
+
+        # ----------------------------------------------------
+        # SCAN TRACK
+        # ----------------------------------------------------
+
+        canvas.create_line(
+            10,
+            88,
+            width - 10,
+            88,
+            fill="#123d32",
+            width=1,
+        )
+
+        # ----------------------------------------------------
+        # NODE TEXT
+        # ----------------------------------------------------
+
+        canvas.create_text(
+            10,
+            8,
+            text="SCAN NODE",
+            anchor="nw",
+            fill="#1b4b40",
+            font=(
+                "Consolas",
+                7,
+                "bold",
+            ),
+        )
+
+        # ----------------------------------------------------
+        # TURTLE
+        # ----------------------------------------------------
+
+        x = self.turtle_x
+        y = 34
+        pixel = 4
+
+        # Pixel turtle facing RIGHT.
+        # 0 = transparent
+        # 1 = shell
+        # 2 = bright outline
+        # 3 = head / details
+
+        frame_1 = [
+            "................",
+            "......2222......",
+            "....22222222....",
+            "...2211111122...",
+            "..221111111122..",
+            ".22111111111122.",
+            "2211111111111122",
+            "2222111111112222",
+            "..222111111222..",
+            "...2222222222...",
+            "...22....22.....",
+            "..222....222....",
+        ]
+
+        frame_2 = [
+            "................",
+            "......2222......",
+            "....22222222....",
+            "...2211111122...",
+            "..221111111122..",
+            ".22111111111122.",
+            "2211111111111122",
+            "2222111111112222",
+            "..222111111222..",
+            "...2222222222...",
+            "....22....22....",
+            "...222....222...",
+        ]
+
+        if self.turtle_frame == 0:
+            sprite = frame_1
+        else:
+            sprite = frame_2
+
+        # ----------------------------------------------------
+        # TRAIL
+        # ----------------------------------------------------
+
+        if self.turtle_running:
+
+            trail_start = max(
+                8,
+                x - 55,
+            )
+
+            canvas.create_line(
+                trail_start,
+                y + 30,
+                x - 5,
+                y + 30,
+                fill="#176b58",
+                width=2,
+            )
+
+        # ----------------------------------------------------
+        # DRAW PIXELS
+        # ----------------------------------------------------
+
+        for row, line in enumerate(sprite):
+
+            for col, value in enumerate(line):
+
+                if value == ".":
+                    continue
+
+                px = x + col * pixel
+                py = y + row * pixel
+
+                if value == "1":
+                    fill = "#087d64"
+
+                elif value == "2":
+                    fill = "#35f2b5"
+
+                else:
+                    fill = "#35f2b5"
+
+                canvas.create_rectangle(
+                    px,
+                    py,
+                    px + pixel,
+                    py + pixel,
+                    fill=fill,
+                    outline="",
+                )
+
+        # ----------------------------------------------------
+        # HEAD
+        # ----------------------------------------------------
+
+        head_x = x + 43
+        head_y = y + 15
+
+        canvas.create_rectangle(
+            head_x,
+            head_y,
+            head_x + 20,
+            head_y + 18,
+            fill="#35f2b5",
+            outline="",
+        )
+
+        canvas.create_rectangle(
+            head_x + 8,
+            head_y + 14,
+            head_x + 22,
+            head_y + 22,
+            fill="#35f2b5",
+            outline="",
+        )
+
+        # ----------------------------------------------------
+        # EYE
+        # ----------------------------------------------------
+
+        canvas.create_rectangle(
+            head_x + 14,
+            head_y + 5,
+            head_x + 18,
+            head_y + 9,
+            fill="#080b0d",
+            outline="",
+        )
+
+        # ----------------------------------------------------
+        # TAIL
+        # ----------------------------------------------------
+
+        tail_x = x - 2
+        tail_y = y + 29
+
+        canvas.create_polygon(
+            tail_x,
+            tail_y,
+            tail_x - 14,
+            tail_y + 6,
+            tail_x,
+            tail_y + 12,
+            fill="#35f2b5",
+            outline="",
+        )
+
+
+    # ========================================================
+    # TURTLE ANIMATION START
+    # ========================================================
+
+    def start_turtle_animation(self):
+
+        if self.turtle_running:
+            return
+
+        self.turtle_running = True
+
+        self.turtle_x = -100
+
+        self.turtle_frame = 0
+
+        self.animate_turtle()
+
+
+    # ========================================================
+    # TURTLE ANIMATION LOOP
+    # ========================================================
+
+    def animate_turtle(self):
+
+        if not self.turtle_running:
+            return
+
+        self.turtle_x += 5
+
+        if self.turtle_frame == 0:
+            self.turtle_frame = 1
+        else:
+            self.turtle_frame = 0
+
+        self.draw_turtle()
+
+        if self.turtle_x > 315:
+            self.turtle_x = -100
+
+        self.root.after(
+            55,
+            self.animate_turtle,
+        )
+
+
+    # ========================================================
+    # TURTLE ANIMATION STOP
+    # ========================================================
+
+    def stop_turtle_animation(self):
+
+        self.turtle_running = False
+
+        self.draw_turtle()
+
+
+    # ========================================================
+    # BROWSE
+    # ========================================================
+
+    def browse(self):
+
+        if self.scanning:
+            return
+
+        directory = filedialog.askdirectory()
+
+        if directory:
+            self.path_var.set(
+                directory
+            )
+
+
+    # ========================================================
+    # START SCAN
+    # ========================================================
+
+    def start_scan(self):
+
+        if self.scanning:
+            return
+
+        directory = (
+            self.path_var
+            .get()
+            .strip()
+        )
+
+        if not directory:
+
+            messagebox.showerror(
+                "CHAMELEON",
+                "Selectează un folder.",
+            )
+
+            return
+
+        if not os.path.isdir(directory):
+
+            messagebox.showerror(
+                "CHAMELEON",
+                "Folderul nu există.",
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # STATE
+        # ----------------------------------------------------
+
+        self.scanning = True
+
+        self.status_label.config(
+            text="● SCANNING...",
+            fg="#ffd166",
+        )
+
+        self.counter_label.config(
+            text="FILES: 0"
+        )
+
+        self.scan_btn.config(
+            state="disabled"
+        )
+
+        self.browse_btn.config(
+            state="disabled"
+        )
+
+        self.baseline_btn.config(
+            state="disabled"
+        )
+
+        # ----------------------------------------------------
+        # TURTLE
+        # ----------------------------------------------------
+
+        self.start_turtle_animation()
+
+        # ----------------------------------------------------
+        # WORKER
+        # ----------------------------------------------------
+
+        worker = threading.Thread(
+            target=self.perform_scan,
+            args=(
+                directory,
+                not self.only_suspicious.get(),
+            ),
+            daemon=True,
+        )
+
+        worker.start()
+
+
+    # ========================================================
+    # PERFORM SCAN
+    # ========================================================
+
+    def perform_scan(self, directory, include_all):
+
+        try:
+
+            data = scan_directory(
+                directory,
+                include_all=include_all,
+                progress_callback=(
+                    self.update_progress
+                ),
+            )
+
+            old_snapshot = load_snapshot()
+
+            results = []
+
+            for path, info in data.items():
+
+                if path not in old_snapshot:
+
+                    info["status"] = "NEW"
+
+                else:
+
+                    old = old_snapshot[path]
+
+                    if (
+                        info["size"]
+                        != old.get("size")
+                        or
+                        info["modified"]
+                        != old.get("modified")
+                    ):
+
+                        info["status"] = "MODIFIED"
+
+                    else:
+
+                        info["status"] = "UNCHANGED"
+
+                results.append(info)
+
+            self.current_snapshot = data
+
+            self.scan_results = results
+
+            self.root.after(
+                0,
+                self.scan_finished,
+            )
+
+        except Exception as error:
+
+            self.root.after(
+                0,
+                lambda err=str(error): (
+                    self.scan_error(err)
+                ),
+            )
+
+
+    # ========================================================
+    # PROGRESS
+    # ========================================================
+
+    def update_progress(self, count):
+
+        self.latest_progress = count
+
+        if self.progress_pending:
+            return
+
+        self.progress_pending = True
+
+        self.root.after(
+            100,
+            self.flush_progress,
+        )
+
+
+    def flush_progress(self):
+
+        self.progress_pending = False
+
+        if self.scanning:
+            self.counter_label.config(
+                text=f"FILES: {self.latest_progress}"
+            )
+
+
+    # ========================================================
+    # SCAN FINISHED
+    # ========================================================
+
+    def scan_finished(self):
+
+        self.scanning = False
+
+        # ----------------------------------------------------
+        # STOP TURTLE
+        # ----------------------------------------------------
+
+        self.stop_turtle_animation()
+
+        # ----------------------------------------------------
+        # REFRESH
+        # ----------------------------------------------------
+
+        self.refresh_table()
+
+        # ----------------------------------------------------
+        # COUNTERS
+        # ----------------------------------------------------
+
+        new_count = sum(
+            1
+            for item in self.scan_results
+            if item["status"] == "NEW"
+        )
+
+        modified_count = sum(
+            1
+            for item in self.scan_results
+            if item["status"] == "MODIFIED"
+        )
+
+        # ----------------------------------------------------
+        # STATUS
+        # ----------------------------------------------------
+
+        self.status_label.config(
+            text=(
+                f"● COMPLETE  //  "
+                f"NEW: {new_count}  "
+                f"MODIFIED: {modified_count}"
+            ),
+            fg="#35f2b5",
+        )
+
+        self.counter_label.config(
+            text=(
+                f"FILES: "
+                f"{len(self.scan_results)}"
+            ),
+        )
+
+        # ----------------------------------------------------
+        # ENABLE BUTTONS
+        # ----------------------------------------------------
+
+        self.scan_btn.config(
+            state="normal"
+        )
+
+        self.browse_btn.config(
+            state="normal"
+        )
+
+        self.baseline_btn.config(
+            state="normal"
+        )
+
+
+    # ========================================================
+    # SCAN ERROR
+    # ========================================================
+
+    def scan_error(self, error):
+
+        self.scanning = False
+
+        self.stop_turtle_animation()
+
+        self.scan_btn.config(
+            state="normal"
+        )
+
+        self.browse_btn.config(
+            state="normal"
+        )
+
+        self.baseline_btn.config(
+            state="normal"
+        )
+
+        self.status_label.config(
+            text="● SCAN ERROR",
+            fg="#ff6b6b",
+        )
+
+        messagebox.showerror(
+            "CHAMELEON",
+            f"Scanarea a eșuat:\n\n{error}",
+        )
+
+
+    # ========================================================
+    # STATUS FILTER
+    # ========================================================
+
+    def update_table_headers(self):
+
+        if not hasattr(self, "tree"):
+            return
+
+        if self.status_filter == "ALL":
+            status_text = "STATUS"
+        else:
+            status_text = f"STATUS [{self.status_filter}]"
+
+        self.tree.heading(
+            "status",
+            text=status_text,
+            command=self.cycle_status_filter,
+        )
+
+        if self.type_filter == "ALL":
+            type_text = "TYPE"
+        else:
+            type_text = f"TYPE [{self.type_filter}]"
+
+        self.tree.heading(
+            "extension",
+            text=type_text,
+            command=self.cycle_extension_filter,
+        )
+
+
+    def cycle_status_filter(self):
+
+        order = [
+            "ALL",
+            "NEW",
+            "MODIFIED",
+            "UNCHANGED",
+        ]
+
+        current_index = order.index(
+            self.status_filter
+        )
+
+        self.status_filter = order[
+            (current_index + 1) % len(order)
+        ]
+
+        self.update_table_headers()
+        self.refresh_table()
+
+
+    def get_extension_filter_options(self):
+
+        extensions = {
+            info["extension"]
+            for info in self.scan_results
+            if info.get("extension")
+        }
+
+        priority = {
+            ".exe": 0,
+            ".msi": 1,
+            ".bat": 2,
+            ".cmd": 3,
+            ".ps1": 4,
+            ".vbs": 5,
+            ".vbe": 6,
+            ".js": 7,
+            ".jse": 8,
+            ".scr": 9,
+            ".com": 10,
+            ".dll": 11,
+            ".hta": 12,
+            ".lnk": 13,
+        }
+
+        ordered = sorted(
+            extensions,
+            key=lambda value: (
+                priority.get(value, 99),
+                value,
+            ),
+        )
+
+        return ["ALL", *ordered]
+
+
+    def cycle_extension_filter(self):
+
+        options = self.get_extension_filter_options()
+
+        if self.type_filter not in options:
+            self.type_filter = "ALL"
+
+        current_index = options.index(
+            self.type_filter
+        )
+
+        self.type_filter = options[
+            (current_index + 1) % len(options)
+        ]
+
+        self.update_table_headers()
+        self.refresh_table()
+
+
+    # ========================================================
+    # REFRESH TABLE
+    # ========================================================
+
+    def refresh_table(self):
+
+        self.table_render_id += 1
+        render_id = self.table_render_id
+
+        # ----------------------------------------------------
+        # CLEAR TABLE
+        # ----------------------------------------------------
+
+        for item in self.tree.get_children():
+
+            self.tree.delete(
+                item
+            )
+
+        # ----------------------------------------------------
+        # FILTER
+        # ----------------------------------------------------
+
+        filtered_results = []
+
+        for info in self.scan_results:
+
+            if (
+                self.only_suspicious.get()
+                and info["extension"]
+                not in WATCH_EXTENSIONS
+            ):
+                continue
+
+            if (
+                self.status_filter != "ALL"
+                and info["status"]
+                != self.status_filter
+            ):
+                continue
+
+            if (
+                self.type_filter != "ALL"
+                and info["extension"]
+                != self.type_filter
+            ):
+                continue
+
+            filtered_results.append(
+                info
+            )
+
+        # ----------------------------------------------------
+        # SORT
+        #
+        # .exe FIRST
+        # .msi SECOND
+        # OTHER EXECUTABLES AFTER
+        # ----------------------------------------------------
+
+        if self.only_suspicious.get():
+
+            extension_priority = {
+                ".exe": 0,
+                ".msi": 1,
+                ".bat": 2,
+                ".cmd": 3,
+                ".ps1": 4,
+                ".vbs": 5,
+                ".vbe": 6,
+                ".js": 7,
+                ".jse": 8,
+                ".scr": 9,
+                ".com": 10,
+                ".dll": 11,
+                ".hta": 12,
+                ".lnk": 13,
+            }
+
+            filtered_results.sort(
+                key=lambda info: (
+                    extension_priority.get(
+                        info["extension"],
+                        99,
+                    ),
+                    info["name"].lower(),
+                )
+            )
+
+        else:
+
+            filtered_results.sort(
+                key=lambda info: (
+                    info["name"].lower()
+                )
+            )
+
+        self.render_table_batch(
+            filtered_results,
+            0,
+            render_id,
+        )
+
+
+    def render_table_batch(self, results, start, render_id):
+
+        if render_id != self.table_render_id:
+            return
+
+        batch_size = 200
+        end = min(start + batch_size, len(results))
+
+        for info in results[start:end]:
+
+            size = self.format_size(
+                info["size"]
+            )
+
+            modified = datetime.fromtimestamp(
+                info["modified"]
+            ).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+
+            self.tree.insert(
+                "",
+                "end",
+                values=(
+                    info["status"],
+                    info["name"],
+                    info["extension"],
+                    size,
+                    modified,
+                    info["path"],
+                ),
+                tags=(
+                    info["status"],
+                ),
+            )
+
+        if end < len(results):
+            self.root.after(
+                1,
+                self.render_table_batch,
+                results,
+                end,
+                render_id,
+            )
+
+
+    # ========================================================
+    # BASELINE
+    # ========================================================
+
+    def set_baseline(self):
+
+        if self.scanning:
+            return
+
+        if not self.current_snapshot:
+
+            messagebox.showwarning(
+                "CHAMELEON",
+                "Rulează întâi un scan.",
+            )
+
+            return
+
+        save_snapshot(
+            self.current_snapshot
+        )
+
+        for info in self.scan_results:
+
+            info["status"] = "UNCHANGED"
+
+        self.refresh_table()
+
+        self.status_label.config(
+            text="● BASELINE UPDATED",
+            fg="#35f2b5",
+        )
+
+        messagebox.showinfo(
+            "CHAMELEON",
+            (
+                "Baseline salvat.\n\n"
+                "Următorul scan va putea detecta "
+                "fișierele apărute sau modificate."
+            ),
+        )
+
+
+    # ========================================================
+    # EXPORT CSV
+    # ========================================================
+
+    def export_csv(self):
+
+        if not self.scan_results:
+
+            messagebox.showwarning(
+                "CHAMELEON",
+                "Nu există rezultate de exportat.",
+            )
+
+            return
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[
+                (
+                    "CSV files",
+                    "*.csv",
+                )
+            ],
+            initialfile="turtle_report.csv",
+        )
+
+        if not filename:
+            return
+
+        try:
+
+            with open(
+                filename,
+                "w",
+                newline="",
+                encoding="utf-8-sig",
+            ) as file:
+
+                writer = csv.writer(
+                    file
+                )
+
+                writer.writerow(
+                    [
+                        "Status",
+                        "File",
+                        "Extension",
+                        "Size",
+                        "Modified",
+                        "Path",
+                    ]
+                )
+
+                for info in self.scan_results:
+
+                    writer.writerow(
+                        [
+                            info["status"],
+                            info["name"],
+                            info["extension"],
+                            info["size"],
+                            datetime.fromtimestamp(
+                                info["modified"]
+                            ).strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            ),
+                            info["path"],
+                        ]
+                    )
+
+            messagebox.showinfo(
+                "CHAMELEON",
+                "Raportul CSV a fost exportat.",
+            )
+
+        except OSError as error:
+
+            messagebox.showerror(
+                "CHAMELEON",
+                (
+                    "Nu am putut salva raportul:\n\n"
+                    f"{error}"
+                ),
+            )
+
+
+    # ========================================================
+    # FORMAT SIZE
+    # ========================================================
+
+    @staticmethod
+    def format_size(size):
+
+        units = [
+            "B",
+            "KB",
+            "MB",
+            "GB",
+            "TB",
+        ]
+
+        value = float(size)
+
+        for unit in units:
+
+            if value < 1024:
+
+                return (
+                    f"{value:.1f} "
+                    f"{unit}"
+                )
+
+            value /= 1024
+
+        return (
+            f"{value:.1f} "
+            "PB"
+        )
+
+
+
+# ============================================================
+# PROGRAM START
+# ============================================================
+
+if __name__== "__main__":
+
+    # --------------------------------------------------------
+    # CREATE TK ROOT FIRST
+    # --------------------------------------------------------
+
+    root = tk.Tk()
+    root.iconbitmap(resource_path("chameleon.ico"))
+
+    # --------------------------------------------------------
+    # WINDOW ICON
+    # --------------------------------------------------------
+
+    icon_path = resource_path(
+        "testoasa.ico"
+    )
+
+    try:
+
+        root.iconbitmap(
+            icon_path
+        )
+
+    except (
+        tk.TclError,
+        OSError,
+    ):
+
+        pass
+
+    # --------------------------------------------------------
+    # CREATE APPLICATION
+    # --------------------------------------------------------
+
+    app = FileWatchApp(
+        root
+    )
+
+    # --------------------------------------------------------
+    # START TKINTER LOOP
+    # --------------------------------------------------------
+
+    root.mainloop() 
